@@ -1,0 +1,10 @@
+{
+  "name": "eth-usdt-signal-engine",
+  "version": "1.2.0",
+  "description": "ETH/USDT multi-factor signal engine with live data, intraday timeframes, live order-book liquidity, 2-year backtest and auto-calibration.",
+  "scripts": {
+    "test": "node test.js",
+    "test:offline": "node test.js --offline"
+  },
+  "license": "MIT"
+}

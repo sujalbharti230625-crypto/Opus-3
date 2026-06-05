@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ETH/USDT Signal Engine — Deep Analysis & Backtest</title>
+<style>
+:root{
+  --bg:#0a0e17; --panel:#111726; --panel2:#0e1422; --line:#1e2940;
+  --txt:#e6edf7; --mut:#8a98b5; --dim:#5d6b88;
+  --grn:#16c784; --grn2:#0d3a2c; --red:#ea3943; --red2:#3a1216;
+  --amb:#f0b90b; --blu:#3b82f6; --pur:#8b5cf6; --cyn:#22d3ee;
+  --rad:14px; --shadow:0 8px 30px rgba(0,0,0,.45);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:radial-gradient(1200px 600px at 80% -10%,#13203a 0%,var(--bg) 55%);color:var(--txt);
+  font-family:'Segoe UI',system-ui,-apple-system,Roboto,Helvetica,Arial,sans-serif;line-height:1.5;-webkit-font-smoothing:antialiased}
+a{color:var(--cyn);text-decoration:none}
+.wrap{max-width:1340px;margin:0 auto;padding:18px 18px 60px}
+/* header */
+header{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;
+  padding:14px 18px;background:linear-gradient(135deg,#121a2e,#0d1322);border:1px solid var(--line);
+  border-radius:var(--rad);box-shadow:var(--shadow);margin-bottom:18px}
+.brand{display:flex;align-items:center;gap:13px}
+.logo{width:44px;height:44px;border-radius:11px;background:linear-gradient(135deg,#627eea,#8b5cf6);
+  display:flex;align-items:center;justify-content:center;box-shadow:0 4px 16px rgba(98,126,234,.5)}
+.logo svg{width:26px;height:26px}
+.brand h1{font-size:19px;letter-spacing:.3px}
+.brand p{font-size:12px;color:var(--mut)}
+.hstat{display:flex;gap:22px;align-items:center;flex-wrap:wrap}
+.hstat .k{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.6px}
+.hstat .v{font-size:18px;font-weight:700;font-variant-numeric:tabular-nums}
+.ctrls{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+button{cursor:pointer;font-family:inherit;border:none;border-radius:10px;font-weight:600;transition:.15s}
+.btn{background:linear-gradient(135deg,#3b82f6,#2563eb);color:#fff;padding:11px 18px;font-size:14px;
+  box-shadow:0 4px 14px rgba(59,130,246,.4)}
+.btn:hover{transform:translateY(-1px);filter:brightness(1.08)}
+.btn.alt{background:linear-gradient(135deg,#8b5cf6,#6d28d9);box-shadow:0 4px 14px rgba(139,92,246,.4)}
+.btn.gho{background:#1a2336;color:var(--txt);box-shadow:none;border:1px solid var(--line)}
+.btn:disabled{opacity:.5;cursor:wait;transform:none}
+select{background:#1a2336;color:var(--txt);border:1px solid var(--line);border-radius:9px;padding:9px 12px;font-size:13px;font-family:inherit}
+/* layout */
+.grid{display:grid;grid-template-columns:1.15fr .85fr;gap:18px}
+@media(max-width:980px){.grid{grid-template-columns:1fr}}
+.card{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--line);
+  border-radius:var(--rad);box-shadow:var(--shadow);overflow:hidden}
+.card h2{font-size:13px;letter-spacing:.7px;text-transform:uppercase;color:var(--mut);
+  padding:14px 18px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:9px}
+.card h2 .dot{width:8px;height:8px;border-radius:50%;background:var(--cyn);box-shadow:0 0 10px var(--cyn)}
+.card .body{padding:18px}
+/* signal box */
+.sig-head{display:flex;align-items:center;gap:16px;padding:20px;border-radius:12px;margin-bottom:16px;
+  border:1px solid var(--line);position:relative;overflow:hidden}
+.sig-head.long{background:linear-gradient(120deg,var(--grn2),#0c1a20)}
+.sig-head.short{background:linear-gradient(120deg,var(--red2),#1a0c10)}
+.sig-head.neutral{background:linear-gradient(120deg,#23252e,#14161d)}
+.sig-badge{font-size:30px;font-weight:800;letter-spacing:1px;padding:8px 20px;border-radius:10px}
+.sig-badge.long{background:var(--grn);color:#04150e}
+.sig-badge.short{background:var(--red);color:#fff}
+.sig-badge.neutral{background:#39414f;color:#fff}
+.sig-meta{flex:1}
+.sig-meta .conf{font-size:13px;color:var(--mut)}
+.conf-bar{height:9px;background:#1b2233;border-radius:6px;overflow:hidden;margin-top:7px;max-width:280px}
+.conf-bar i{display:block;height:100%;border-radius:6px;background:linear-gradient(90deg,#f0b90b,#16c784)}
+.lvls{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}
+.lvl{background:#0e1525;border:1px solid var(--line);border-radius:11px;padding:13px 15px}
+.lvl .lab{font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--dim);display:flex;align-items:center;gap:6px}
+.lvl .num{font-size:21px;font-weight:700;font-variant-numeric:tabular-nums;margin-top:3px}
+.lvl.entry .num{color:var(--blu)} .lvl.stop .num{color:var(--red)}
+.lvl.t1 .num,.lvl.t2 .num,.lvl.t3 .num{color:var(--grn)}
+.lvl .sub{font-size:11px;color:var(--mut);margin-top:2px}
+.tag{display:inline-block;font-size:11px;padding:2px 8px;border-radius:6px;background:#1c2740;color:var(--cyn);margin:2px 4px 2px 0}
+/* factor list */
+.fac{display:flex;align-items:center;gap:12px;padding:11px 0;border-bottom:1px solid #161e30}
+.fac:last-child{border:none}
+.fac .ic{width:34px;height:34px;border-radius:9px;flex:none;display:flex;align-items:center;justify-content:center;background:#16203a}
+.fac .ic svg{width:18px;height:18px}
+.fac .t{flex:1}
+.fac .t b{font-size:14px} .fac .t span{font-size:12px;color:var(--mut);display:block}
+.pill{font-size:12px;font-weight:700;padding:4px 11px;border-radius:20px;white-space:nowrap}
+.pill.bull{background:var(--grn2);color:var(--grn)} .pill.bear{background:var(--red2);color:var(--red)}
+.pill.neu{background:#262b38;color:var(--mut)}
+/* tv */
+#tv{height:480px;width:100%}
+.tvfb{height:480px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;color:var(--mut);text-align:center;padding:20px}
+/* backtest */
+.bt-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:18px}
+.kpi{background:#0e1525;border:1px solid var(--line);border-radius:11px;padding:14px}
+.kpi .k{font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--dim)}
+.kpi .v{font-size:24px;font-weight:700;font-variant-numeric:tabular-nums;margin-top:4px}
+.kpi .v.pos{color:var(--grn)} .kpi .v.neg{color:var(--red)}
+#equity{width:100%;height:240px;display:block}
+table{width:100%;border-collapse:collapse;font-size:12.5px;font-variant-numeric:tabular-nums}
+th{text-align:right;color:var(--dim);font-weight:600;padding:9px 10px;border-bottom:1px solid var(--line);
+  font-size:11px;text-transform:uppercase;letter-spacing:.5px;position:sticky;top:0;background:var(--panel)}
+th:first-child,td:first-child{text-align:left}
+td{padding:9px 10px;border-bottom:1px solid #141b2b}
+tr:hover td{background:#121a2c}
+.tw{color:var(--grn);font-weight:600}.tl{color:var(--red);font-weight:600}
+.scroll{max-height:340px;overflow:auto;border-radius:10px;border:1px solid var(--line)}
+/* calib */
+.calib-row{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}
+.cchip{background:#0e1525;border:1px solid var(--line);border-radius:9px;padding:8px 13px;font-size:12.5px}
+.cchip b{color:var(--cyn);font-variant-numeric:tabular-nums}
+/* status / log */
+#status{display:flex;align-items:center;gap:10px;font-size:13px;color:var(--mut);min-height:22px}
+.spin{width:15px;height:15px;border:2px solid #2a3450;border-top-color:var(--cyn);border-radius:50%;animation:sp .7s linear infinite;display:none}
+@keyframes sp{to{transform:rotate(360deg)}}
+.muted{color:var(--mut);font-size:13px}
+.disc{font-size:11.5px;color:var(--dim);background:#0e1424;border:1px solid var(--line);border-radius:11px;padding:14px 16px;margin-top:18px;line-height:1.6}
+.sec-gap{margin-top:18px}
+.flexrow{display:flex;gap:18px;flex-wrap:wrap}
+.flexrow>*{flex:1;min-width:300px}
+.legend{display:flex;gap:16px;flex-wrap:wrap;font-size:12px;color:var(--mut);margin-top:8px}
+.legend i{display:inline-block;width:12px;height:3px;border-radius:2px;margin-right:5px;vertical-align:middle}
+h3.sub{font-size:13px;color:var(--mut);margin:18px 0 8px;letter-spacing:.4px}
+.zone-bar{display:flex;flex-direction:column;gap:7px}
+.zrow{display:flex;align-items:center;gap:10px;font-size:12.5px}
+.zrow .bar{height:18px;border-radius:5px;flex:1}
+.zrow .px{width:78px;text-align:right;font-variant-numeric:tabular-nums;color:var(--mut)}
+.zrow .lbl{width:64px;font-size:11px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div class="brand">
+    <div class="logo"><svg viewBox="0 0 256 417" fill="#fff"><path d="M127.9 0l-2.8 9.5v275.7l2.8 2.8 127.9-75.6z" opacity=".7"/><path d="M127.9 0L0 212.4l127.9 75.6V154.2z"/><path d="M127.9 312.2l-1.6 1.9v98.2l1.6 4.7L256 236.6z" opacity=".7"/><path d="M127.9 417V312.2L0 236.6z"/><path d="M127.9 288l127.9-75.6-127.9-58.2z" opacity=".4"/><path d="M0 212.4L127.9 288V154.2z" opacity=".7"/></svg></div>
+    <div>
+      <h1>ETH/USDT Signal Engine</h1>
+      <p>Deep multi-factor analysis · live Binance/Delta ETHUSDT data · 2-yr backtest & auto-calibration</p>
+    </div>
+  </div>
+  <div class="hstat">
+    <div><div class="k">ETH Price</div><div class="v" id="hPrice">—</div></div>
+    <div><div class="k">1D Δ</div><div class="v" id="h24">—</div></div>
+    <div><div class="k">USDT.D</div><div class="v" id="hUsdt">—</div></div>
+  </div>
+  <div class="ctrls">
+    <select id="source" title="Live ETH/USDT data source">
+      <option value="binance">Binance.US · ETHUSDT</option>
+      <option value="delta">Delta Exchange · ETHUSDT</option>
+      <option value="coinbase">Coinbase · ETH-USD</option>
+    </select>
+    <select id="profile" title="Trading timeframe profile">
+      <option value="swing">Swing · 1D (1W·2D·1D)</option>
+      <option value="intraday">Intraday · 4H (1D·4H·1H)</option>
+      <option value="scalp">Scalp · 1H (4H·1H·15m)</option>
+    </select>
+    <button class="btn" id="runBtn">⟳ Run Analysis</button>
+  </div>
+</header>
+
+<div id="status"><span class="spin" id="spin"></span><span id="statusTxt">Ready. Click “Run Analysis” to fetch live data.</span></div>
+
+<!-- TOP: signal + factors -->
+<div class="grid sec-gap">
+  <div class="card">
+    <h2><span class="dot"></span>Live Trade Signal</h2>
+    <div class="body" id="sigBody">
+      <p class="muted">Run the analysis to generate a calibrated signal with entry, stop-loss and targets.</p>
+    </div>
+  </div>
+  <div class="card">
+    <h2><span class="dot" style="background:var(--pur);box-shadow:0 0 10px var(--pur)"></span>Confluence Breakdown</h2>
+    <div class="body" id="facBody">
+      <p class="muted">Each analytical module votes bullish / bearish / neutral. The weighted net drives the signal.</p>
+    </div>
+  </div>
+</div>
+
+<!-- CHART -->
+<div class="card sec-gap">
+  <h2><span class="dot" style="background:var(--blu);box-shadow:0 0 10px var(--blu)"></span>Live Chart — TradingView (<span id="tvSym">BINANCE:ETHUSDT</span>)</h2>
+  <div class="body" style="padding:0">
+    <div id="tv"><div class="tvfb"><div class="spin" style="display:block"></div><div>Loading TradingView widget…<br><span style="font-size:12px">(requires internet — open the downloaded file in a browser)</span></div></div></div>
+  </div>
+</div>
+
+<!-- ZONES + LIQUIDITY -->
+<div class="grid sec-gap">
+  <div class="card">
+    <h2><span class="dot" style="background:var(--amb);box-shadow:0 0 10px var(--amb)"></span>Supply & Demand Zones</h2>
+    <div class="body" id="zoneBody"><p class="muted">Detected institutional zones appear here after analysis.</p></div>
+  </div>
+  <div class="card">
+    <h2><span class="dot" style="background:var(--cyn);box-shadow:0 0 10px var(--cyn)"></span>Liquidity Heat Map (<span id="liqSrc">live exchange</span>)</h2>
+    <div class="body" id="liqBody"><p class="muted">Resting-liquidity pools & volume nodes appear here after analysis.</p></div>
+  </div>
+</div>
+
+<!-- LIVE ORDER BOOK -->
+<div class="card sec-gap">
+  <h2><span class="dot" style="background:var(--red);box-shadow:0 0 10px var(--red)"></span>Live Order-Book Depth & Liquidity Walls (<span id="obSrc">—</span>)</h2>
+  <div class="body" id="obBody"><p class="muted">A real L2 order-book snapshot (bids vs asks within ±4% of price) loads here after analysis — showing resting liquidity walls and bid/ask imbalance.</p></div>
+</div>
+
+<!-- BACKTEST -->
+<div class="card sec-gap">
+  <h2><span class="dot" style="background:var(--grn);box-shadow:0 0 10px var(--grn)"></span>2-Year Backtest & Auto-Calibration</h2>
+  <div class="body">
+    <div class="flexrow" style="align-items:center;margin-bottom:6px">
+      <div class="muted" id="btIntro">The engine walks forward over the loaded history (≈2 years on the Swing profile, or the deepest intraday window available), sweeps the strategy parameters per the selected timeframe, and locks in the combination with the best historical expectancy. That calibrated parameter set is what produces the live signal above. (Note: the order-book module is live-only and is not part of the historical backtest.)</div>
+      <div style="flex:0 0 auto"><button class="btn alt" id="calibBtn" disabled>⚙ Run Backtest & Calibrate</button></div>
+    </div>
+    <div id="calibChips" class="calib-row"></div>
+    <div id="btResults" style="display:none">
+      <div class="bt-grid sec-gap" id="kpis"></div>
+      <h3 class="sub">Equity Curve (compounded R-multiple, 1R risk per trade)</h3>
+      <canvas id="equity"></canvas>
+      <div class="legend"><span><i style="background:var(--grn)"></i>Equity (cumulative R)</span><span><i style="background:var(--red)"></i>Drawdown</span></div>
+      <h3 class="sub">Trade Log (most recent 40)</h3>
+      <div class="scroll">
+        <table id="tradeTbl"><thead><tr><th>#</th><th>Date</th><th>Side</th><th>Entry</th><th>Stop</th><th>Target</th><th>Exit</th><th>R</th><th>Result</th></tr></thead><tbody></tbody></table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="disc" id="disc">
+  <b>⚠ Risk Disclaimer — Educational Tool, Not Financial Advice.</b><br>
+  This application is an analytical and educational instrument. It generates algorithmic signals from public market data (Binance.US, Delta Exchange, Coinbase, CoinGecko) using technical heuristics (price action, market structure, supply/demand, volume & live order-book liquidity, candlesticks, momentum, multi-timeframe confluence, a simplified Elliott-wave model, and Tether-dominance correlation). <b>Backtested performance is hypothetical, does not include slippage, funding or fees beyond a configurable assumption, and is not indicative of future results.</b> Cryptocurrency trading involves substantial risk of loss. Nothing here is financial, investment, legal or tax advice. Do your own research and never risk capital you cannot afford to lose. TradingView is a trademark of its respective owner; this tool is not affiliated with or endorsed by TradingView, Binance, Delta Exchange or Coinbase.
+</div>
+
+</div>
+
+<script src="https://s3.tradingview.com/tv.js"></script>
+<script src="engine.js"></script>
+<script src="app.js"></script>
+<script>(function(){function c(){var b=a.contentDocument||a.contentWindow.document;if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a0712efd6f64f27f',t:'MTc4MDY4MzU0NQ=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+</html>
