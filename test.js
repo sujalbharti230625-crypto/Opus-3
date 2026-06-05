@@ -131,6 +131,42 @@ section('Module directionality');
   eq(E.tetherDom([1, 2]).score, 0, 'tetherDom: too short → neutral');
 })();
 
+section('Price Action module');
+(() => {
+  const up = trendUp(260), down = trendDown(260);
+  const paUp = E.priceAction(up, E.M.atr(up, 14));
+  const paDn = E.priceAction(down, E.M.atr(down, 14));
+  ok(paUp.score > 0, 'priceAction bullish bias in uptrend');
+  ok(paDn.score < 0, 'priceAction bearish bias in downtrend');
+  ok(Array.isArray(paUp.fvg), 'priceAction returns FVG array');
+  ok(paUp.range && typeof paUp.range.posPct === 'number', 'priceAction returns range/posPct');
+  ok(paUp.score >= -1 && paUp.score <= 1, 'priceAction score bounded');
+  // insufficient data → neutral, no crash
+  eq(E.priceAction(up.slice(0, 10), null).score, 0, 'priceAction: short data → neutral');
+
+  // FVG detection: craft a clean 3-candle bullish gap (c3.low > c1.high)
+  const g = [];
+  for (let i = 0; i < 30; i++) g.push({ t: i, o: 100, h: 101, l: 99, c: 100, v: 1 });
+  g.push({ t: 30, o: 100, h: 102, l: 99, c: 101, v: 1 });   // c1
+  g.push({ t: 31, o: 101, h: 112, l: 101, c: 111, v: 1 });  // c2 strong up
+  g.push({ t: 32, o: 111, h: 115, l: 105, c: 113, v: 1 });  // c3 low(105) > c1 high(102)
+  const pg = E.priceAction(g, E.M.atr(g, 14));
+  ok(pg.fvg.some(f => f.type === 'bull'), 'priceAction detects a bullish FVG');
+  ok(pg.fvg.every(f => typeof f.t === 'number'), 'FVGs carry a timestamp (for plotting)');
+
+  // order blocks exposed as a plottable array with timestamps
+  ok(Array.isArray(paUp.orderBlocks), 'priceAction returns orderBlocks array');
+  ok(paUp.orderBlocks.every(o => typeof o.t === 'number' && (o.type === 'bull' || o.type === 'bear')),
+    'order blocks have timestamp & type');
+
+  // trend-aware premium/discount: downtrend should NOT be flipped bullish by being at lows
+  ok(E.marketStructure(down).score < 0 && paDn.score < 0, 'downtrend stays bearish (no mean-revert flip)');
+
+  // CHoCH detection: build downtrend then break a swing high
+  const ms = E.marketStructure(down);
+  ok(typeof ms.trendDir === 'number', 'marketStructure exposes trendDir');
+})();
+
 section('Order-book module');
 (() => {
   const price = 2000;
@@ -196,6 +232,15 @@ section('buildSignal robustness');
 
   // confidence bounded 0..100
   ok(sUp.confidence >= 0 && sUp.confidence <= 100, 'confidence in [0,100]');
+
+  // PA-only mode: mutes indicator/macro weights but still produces a signal
+  const sPa = E.buildSignal(mkTf(trendUp(400)), null, { paOnly: true });
+  eq(sPa.params.trend, 0, 'PA-only mutes EMA trend weight');
+  eq(sPa.params.momentum, 0, 'PA-only mutes momentum weight');
+  eq(sPa.params.elliott, 0, 'PA-only mutes Elliott weight');
+  eq(sPa.params.tether, 0, 'PA-only mutes Tether weight');
+  finiteNum(sPa.net, 'PA-only net finite');
+  ok(sPa.side === 'LONG', 'PA-only still goes LONG on a clean uptrend');
 })();
 
 /* ============================================================
@@ -204,28 +249,61 @@ section('buildSignal robustness');
 section('Backtest & calibrate');
 (() => {
   const rw = randomWalk(500, 7);
-  const bt = E.backtest(rw, null, {});
+  const bt = E.backtest(rw, null, {}, { capital: 10000, riskPct: 1 });
   finiteNum(bt.stats.n, 'backtest n finite');
   ok(bt.stats.n >= 0, 'backtest n non-negative');
   eq(bt.trades.length, bt.stats.n, 'trades length matches n');
-  eq(bt.curve.length, bt.stats.n, 'curve length matches n');
+  eq(bt.curve.length, bt.stats.n + 1, 'curve length = n + 1 (seed point)');
   if (bt.stats.n > 0) {
     eq(bt.stats.wins + bt.stats.losses, bt.stats.n, 'wins+losses = n');
     approx(bt.stats.winRate, bt.stats.wins / bt.stats.n * 100, 1e-6, 'winRate consistent');
-    // totalR equals last equity point
-    approx(bt.stats.totalR, bt.curve[bt.curve.length - 1].eq, 1e-6, 'totalR = last equity');
-    ok(bt.stats.maxDD >= 0, 'maxDD non-negative');
+    // final equity = last curve point, and = capital + netProfit
+    approx(bt.stats.finalEquity, bt.curve[bt.curve.length - 1].equity, 1e-6, 'finalEquity = last curve equity');
+    approx(bt.stats.finalEquity, bt.stats.capital + bt.stats.netProfit, 1e-6, 'finalEquity = capital + netProfit');
+    approx(bt.stats.returnPct, bt.stats.netProfit / bt.stats.capital * 100, 1e-6, 'returnPct consistent');
+    ok(bt.stats.maxDD >= 0 && bt.stats.maxDDpct >= 0, 'maxDD/maxDDpct non-negative');
+    ok(bt.stats.totalFees >= 0, 'totalFees non-negative');
   }
 
+  // --- dollar-model specifics ---
+  // position sizing: risk ≈ riskPct of capital on first trade (before BE/partials)
+  const bt2 = E.backtest(rw, null, {}, { capital: 50000, riskPct: 2, style: 'swing', beAfterTP1: false });
+  if (bt2.trades.length) {
+    const t = bt2.trades[0];
+    const riskTaken = t.qty * Math.abs(t.entry - t.stop);
+    approx(riskTaken, 50000 * 0.02, 50000 * 0.02 * 0.001 + 1e-6, 'qty sized to 2% risk (pre-leverage cap)');
+    ok(t.notional > 0 && t.fees > 0, 'trade has notional & fees');
+    ok(t.fills && t.fills.length >= 1, 'trade has fills (partial exits)');
+  }
+  // leverage cap limits notional
+  const btLev = E.backtest(rw, null, {}, { capital: 1000, riskPct: 50, maxLeverage: 5 });
+  if (btLev.trades.length) {
+    ok(btLev.trades[0].notional <= 1000 * 5 + 1e-6, 'notional capped by max leverage');
+  }
+  // fees scale with taker rate
+  const loFee = E.backtest(rw, null, {}, { fees: { maker: 0, taker: 0.0001, gst: 0 } });
+  const hiFee = E.backtest(rw, null, {}, { fees: { maker: 0, taker: 0.01, gst: 0 } });
+  if (loFee.stats.n && hiFee.stats.n) ok(hiFee.stats.totalFees > loFee.stats.totalFees, 'higher taker fee → more fees paid');
+  // trade style changes horizon → generally different trade count or holding
+  const scalp = E.backtest(rw, null, {}, { style: 'scalp' });
+  const swing = E.backtest(rw, null, {}, { style: 'swing' });
+  ok(scalp.stats.n >= 0 && swing.stats.n >= 0, 'scalp & swing both run');
+  // STYLES & DELTA_FEES exposed
+  ok(E.STYLES && E.STYLES.scalp && E.STYLES.swing, 'STYLES preset exposed');
+  approx(E.DELTA_FEES.taker, 0.0005, 1e-9, 'Delta taker fee default 0.05%');
+  approx(E.DELTA_FEES.maker, 0.0002, 1e-9, 'Delta maker fee default 0.02%');
+
   // empty/degenerate: flat data → zero trades, no crash
-  const btFlat = E.backtest(flat(400), null, {});
+  const btFlat = E.backtest(flat(400), null, {}, { capital: 10000 });
   eq(btFlat.stats.n, 0, 'flat data → 0 trades');
+  eq(btFlat.stats.finalEquity, 10000, 'flat data → equity unchanged');
 
   // calibrate returns a best with params + bt
   const cal = E.calibrate(rw, null, null, { htf: 5, mtf: 2, warmup: 210, fwdMax: 30 });
   ok(cal.best && cal.best.params, 'calibrate returns best.params');
   ok(cal.best.bt && cal.best.bt.stats, 'calibrate best has bt.stats');
-  ok(cal.results.length === 108, 'calibrate swept full 108-cell grid');
+  ok(cal.results.length === 216, 'calibrate swept full 216-cell grid (incl. priceAction)');
+  ok(cal.best.params.priceAction != null, 'calibrated params include priceAction weight');
   ok(typeof cal.best.params.threshold === 'number', 'best.threshold numeric');
 
   // intraday opts: different warmup/htf must still run
@@ -317,10 +395,12 @@ async function integration() {
     const st = (Math.floor(Date.now() / 1000) - 740 * 86400) * 1000;
     const rows = await getJSON(`https://api.binance.us/api/v3/klines?symbol=ETHUSDT&interval=1d&limit=1000&startTime=${st}`);
     const daily = rows.map(r => ({ t: Math.floor(r[0] / 1000), o: +r[1], h: +r[2], l: +r[3], c: +r[4], v: +r[5] }));
-    const cal = E.calibrate(daily, null);
+    const cal = E.calibrate(daily, null, null, { capital: 10000, riskPct: 1, style: 'swing', maxLeverage: 25 });
     ok(cal.best && cal.best.params, 'live calibration produced a best param set');
     finiteNum(cal.best.stats.winRate, 'live calibrated win rate finite');
-    console.log(`  ℹ live calibration: ${cal.best.stats.n} trades, ${cal.best.stats.winRate.toFixed(1)}% win, PF ${isFinite(cal.best.stats.profitFactor)?cal.best.stats.profitFactor.toFixed(2):'∞'}, ${cal.best.stats.totalR.toFixed(1)}R`);
+    finiteNum(cal.best.stats.finalEquity, 'live calibrated final equity finite');
+    const s = cal.best.stats;
+    console.log(`  ℹ live calibration ($10k, 1% risk, swing): ${s.n} trades, ${s.winRate.toFixed(1)}% win, PF ${isFinite(s.profitFactor)?s.profitFactor.toFixed(2):'∞'}, $${s.capital}→$${s.finalEquity.toFixed(0)} (${s.returnPct>=0?'+':''}${s.returnPct.toFixed(1)}%), $${s.totalFees.toFixed(0)} fees`);
   } catch (e) { okNet(false, 'Live pipeline', e); }
 }
 

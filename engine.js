@@ -124,21 +124,43 @@ function swings(c, look = 3) {
 function marketStructure(c) {
   const s = swings(c);
   const H = s.hi.slice(-2), L = s.lo.slice(-2);
-  let score = 0, txt = 'Range / unclear';
+  let score = 0, txt = 'Range / unclear', trendDir = 0;
   if (H.length === 2 && L.length === 2) {
     const hh = H[1].p > H[0].p, hl = L[1].p > L[0].p;
     const lh = H[1].p < H[0].p, ll = L[1].p < L[0].p;
-    if (hh && hl) { score = 1; txt = 'Uptrend — Higher Highs & Higher Lows'; }
-    else if (lh && ll) { score = -1; txt = 'Downtrend — Lower Highs & Lower Lows'; }
+    if (hh && hl) { score = 1; trendDir = 1; txt = 'Uptrend — Higher Highs & Higher Lows'; }
+    else if (lh && ll) { score = -1; trendDir = -1; txt = 'Downtrend — Lower Highs & Lower Lows'; }
     else if (hh && ll) { score = 0; txt = 'Expanding range / volatility'; }
     else { score = 0; txt = 'Contracting / transitional structure'; }
   }
-  // Break of structure (last close vs last swing high/low)
   const last = c[c.length - 1].c;
-  let bos = '';
-  if (s.hi.length && last > s.hi[s.hi.length - 1].p) { bos = 'Bullish BOS (broke last swing high)'; score = Math.min(1, score + 0.5); }
-  if (s.lo.length && last < s.lo[s.lo.length - 1].p) { bos = 'Bearish BOS (broke last swing low)'; score = Math.max(-1, score - 0.5); }
-  return { score, label: 'Market Structure', detail: txt + (bos ? ' · ' + bos : ''), swings: s };
+  const lastHi = s.hi.length ? s.hi[s.hi.length - 1] : null;
+  const lastLo = s.lo.length ? s.lo[s.lo.length - 1] : null;
+
+  // Break of Structure (BOS) = continuation in the prevailing trend direction.
+  // Change of Character (CHoCH) = first break AGAINST the prevailing trend (early reversal).
+  let event = '';
+  if (lastHi && last > lastHi.p) {
+    if (trendDir < 0) { event = 'Bullish CHoCH (broke down-trend high → possible reversal up)'; score = Math.min(1, score + 0.7); }
+    else { event = 'Bullish BOS (continuation, broke last swing high)'; score = Math.min(1, score + 0.5); }
+  } else if (lastLo && last < lastLo.p) {
+    if (trendDir > 0) { event = 'Bearish CHoCH (broke up-trend low → possible reversal down)'; score = Math.max(-1, score - 0.7); }
+    else { event = 'Bearish BOS (continuation, broke last swing low)'; score = Math.max(-1, score - 0.5); }
+  }
+
+  // Displacement: is the latest candle an outsized momentum move (institutional intent)?
+  const n = c.length, atrApprox = (() => {
+    let s2 = 0, k = 0; for (let j = Math.max(1, n - 14); j < n; j++) { s2 += Math.abs(c[j].c - c[j - 1].c); k++; }
+    return k ? s2 / k : 0;
+  })();
+  const lastBody = Math.abs(c[n - 1].c - c[n - 1].o);
+  if (atrApprox > 0 && lastBody > atrApprox * 1.8) {
+    const dir = c[n - 1].c > c[n - 1].o ? 1 : -1;
+    event += (event ? ' · ' : '') + (dir > 0 ? 'Bullish displacement' : 'Bearish displacement');
+    score = Math.max(-1, Math.min(1, score + dir * 0.2));
+  }
+
+  return { score: Math.max(-1, Math.min(1, score)), label: 'Market Structure', detail: txt + (event ? ' · ' + event : ''), swings: s, trendDir };
 }
 
 /* 2. Price-action trend via EMA stack + slope */
@@ -203,6 +225,117 @@ function candles(c) {
   }
   if (!found.length) found.push('No major pattern');
   return { score: Math.max(-1, Math.min(1, score)), label: 'Candlestick Patterns', detail: found.join(' · ') };
+}
+
+/* 4b. PRICE ACTION — pure-PA concepts the other modules don't cover:
+   Fair Value Gaps (imbalance), liquidity sweeps / stop-runs, premium-discount
+   positioning within the dealing range, order blocks, and rejection wicks.
+   This is the heaviest-weighted module per the price-action emphasis. */
+function priceAction(c, atrArr) {
+  const n = c.length;
+  if (n < 30) return { score: 0, label: 'Price Action (PA)', detail: 'Insufficient data', fvg: [] };
+  const atr = (atrArr && atrArr[n - 1]) || (c[n - 1].c * 0.02);
+  const price = c[n - 1].c;
+  let score = 0; const parts = [];
+
+  // --- (1) Fair Value Gaps / imbalance: 3-candle gap where wick of c[i-1] and
+  // c[i+1] don't overlap. Unfilled FVGs near price act as magnets / support. ---
+  const fvg = [];
+  for (let i = 2; i < n; i++) {
+    const a = c[i - 2], b = c[i - 1], d = c[i];
+    // bullish FVG: gap between a.high and d.low (impulse up leaves void)
+    if (d.l > a.h && (b.c - b.o) > 0) fvg.push({ type: 'bull', lo: a.h, hi: d.l, i, t: d.t, mid: (a.h + d.l) / 2 });
+    // bearish FVG: gap between a.low and d.high (impulse down)
+    if (d.h < a.l && (b.c - b.o) < 0) fvg.push({ type: 'bear', lo: d.h, hi: a.l, i, t: d.t, mid: (d.h + a.l) / 2 });
+  }
+  // unfilled FVGs = price hasn't traded back through them since
+  const unfilled = fvg.filter(g => {
+    for (let j = g.i + 1; j < n; j++) {
+      if (g.type === 'bull' && c[j].l <= g.lo) return false;
+      if (g.type === 'bear' && c[j].h >= g.hi) return false;
+    }
+    return true;
+  }).slice(-4);
+  const recentFvg = fvg.slice(-1)[0];
+  if (recentFvg && recentFvg.i >= n - 3) {
+    if (recentFvg.type === 'bull') { score += 0.4; parts.push('Fresh bullish FVG (imbalance up)'); }
+    else { score -= 0.4; parts.push('Fresh bearish FVG (imbalance down)'); }
+  }
+
+  // --- (2) Liquidity sweep / stop run: price pokes beyond a recent swing
+  // extreme then closes back inside → liquidity grab, reversal fuel. ---
+  const look = 20;
+  const seg = c.slice(Math.max(0, n - look), n - 1);
+  const recentHigh = Math.max(...seg.map(x => x.h));
+  const recentLow = Math.min(...seg.map(x => x.l));
+  const last = c[n - 1];
+  if (last.h > recentHigh && last.c < recentHigh) { score -= 0.5; parts.push('Sell-side sweep (swept highs, closed back in → bearish)'); }
+  if (last.l < recentLow && last.c > recentLow) { score += 0.5; parts.push('Buy-side sweep (swept lows, closed back in → bullish)'); }
+
+  // --- (3) Premium / discount within the dealing range (last ~40 bars).
+  // Mean-reversion (discount→long, premium→short) only applies in a RANGE.
+  // In a trend, premium/discount instead flags with-trend pullback entries. ---
+  const dr = c.slice(Math.max(0, n - 40));
+  const drHi = Math.max(...dr.map(x => x.h)), drLo = Math.min(...dr.map(x => x.l));
+  const eq = (drHi + drLo) / 2, span = (drHi - drLo) || 1;
+  const posPct = (price - drLo) / span; // 0=low,1=high
+  // is the dealing range itself trending? compare first-half vs second-half mid
+  const half = Math.floor(dr.length / 2);
+  const midA = dr.slice(0, half).reduce((s, x) => s + x.c, 0) / (half || 1);
+  const midB = dr.slice(half).reduce((s, x) => s + x.c, 0) / ((dr.length - half) || 1);
+  const rangeTrend = (midB - midA) / (eq || 1); // >0.03 up, <-0.03 down
+  const trending = Math.abs(rangeTrend) > 0.03;
+  if (!trending) {
+    // range → classic mean reversion
+    if (posPct < 0.4) { score += 0.3; parts.push('Discount of range (' + (posPct * 100).toFixed(0) + '% → favor longs)'); }
+    else if (posPct > 0.6) { score -= 0.3; parts.push('Premium of range (' + (posPct * 100).toFixed(0) + '% → favor shorts)'); }
+    else parts.push('Equilibrium (~50% of range)');
+  } else if (rangeTrend > 0) {
+    // uptrend → buy pullbacks into discount, don't fade premium
+    if (posPct < 0.45) { score += 0.35; parts.push('Discount pullback in uptrend (with-trend long)'); }
+    else parts.push('Premium in uptrend (wait for pullback)');
+  } else {
+    // downtrend → sell rallies into premium, don't fade discount
+    if (posPct > 0.55) { score -= 0.35; parts.push('Premium rally in downtrend (with-trend short)'); }
+    else parts.push('Discount in downtrend (wait for rally)');
+  }
+
+  // --- (4) Order blocks: opposite-color candle before a displacement move.
+  // Collect recent ones (for plotting); score only when price is inside one. ---
+  const orderBlocks = [];
+  for (let i = n - 2; i >= Math.max(1, n - 60); i--) {
+    const mv = c[i + 1];
+    if (Math.abs(mv.c - mv.o) <= atr * 1.5) continue;
+    if (mv.c > mv.o && c[i].c < c[i].o) { // bullish OB (down candle before up displacement)
+      // mitigated if price has since traded fully below it
+      let mitig = false; for (let j = i + 2; j < n; j++) if (c[j].c < c[i].l) { mitig = true; break; }
+      orderBlocks.push({ type: 'bull', lo: c[i].l, hi: c[i].h, i, t: c[i].t, mitigated: mitig });
+    } else if (mv.c < mv.o && c[i].c > c[i].o) { // bearish OB
+      let mitig = false; for (let j = i + 2; j < n; j++) if (c[j].c > c[i].h) { mitig = true; break; }
+      orderBlocks.push({ type: 'bear', lo: c[i].l, hi: c[i].h, i, t: c[i].t, mitigated: mitig });
+    }
+  }
+  // nearest unmitigated OB drives the score
+  const nearestOB = orderBlocks.filter(o => !o.mitigated)
+    .sort((a, b) => Math.abs((a.lo + a.hi) / 2 - price) - Math.abs((b.lo + b.hi) / 2 - price))[0];
+  if (nearestOB) {
+    if (nearestOB.type === 'bull' && price >= nearestOB.lo && price <= nearestOB.hi * 1.01) { score += 0.35; parts.push('Price at bullish order block'); }
+    if (nearestOB.type === 'bear' && price <= nearestOB.hi && price >= nearestOB.lo * 0.99) { score -= 0.35; parts.push('Price at bearish order block'); }
+  }
+  const obPlot = orderBlocks.filter(o => !o.mitigated).slice(0, 6);
+
+  // --- (5) Rejection wick on the last candle (pressure imbalance). ---
+  const body = Math.abs(last.c - last.o), rng = (last.h - last.l) || 1e-9;
+  const upW = last.h - Math.max(last.c, last.o), dnW = Math.min(last.c, last.o) - last.l;
+  if (dnW > rng * 0.55 && body < rng * 0.4) { score += 0.25; parts.push('Long lower wick (demand rejection)'); }
+  if (upW > rng * 0.55 && body < rng * 0.4) { score -= 0.25; parts.push('Long upper wick (supply rejection)'); }
+
+  if (!parts.length) parts.push('Neutral price action');
+  return {
+    score: Math.max(-1, Math.min(1, score)), label: 'Price Action (PA)',
+    detail: parts.join(' · '), fvg: unfilled, orderBlocks: obPlot,
+    range: { hi: drHi, lo: drLo, eq, posPct }
+  };
 }
 
 /* 5. Supply & demand zones — find consolidation bases before strong moves */
@@ -371,45 +504,65 @@ function tetherDom(usdtSeries) {
    tfData = {high:[candles], mid:[candles], low:[candles]}
    weights configurable for calibration
    ============================================================ */
+/* Weights — PRICE-ACTION EMPHASIS.
+   Pure price-action modules (priceAction, market structure, supply/demand,
+   candlesticks) dominate; lagging indicators (EMA trend, RSI/MACD momentum,
+   Elliott) are de-emphasized to a confirming role. */
 const DEFAULT_W = {
-  structure: 1.4, trend: 1.2, momentum: 1.0, candles: 0.8,
-  zones: 1.1, liquidity: 0.9, elliott: 0.7, tether: 1.0,
-  tfHigh: 1.5, tfMid: 1.0, tfLow: 0.6
+  priceAction: 2.2,   // FVG, sweeps, premium/discount, order blocks, rejection
+  structure: 2.0,     // BOS / CHoCH / displacement (raised)
+  zones: 1.6,         // supply & demand (raised)
+  candles: 1.3,       // candlestick patterns (raised)
+  liquidity: 1.0,
+  trend: 0.7,         // EMA stack — confirming only (lowered)
+  momentum: 0.6,      // RSI/MACD — confirming only (lowered)
+  elliott: 0.5,       // lowered
+  tether: 0.9,
+  tfHigh: 1.5, tfMid: 1.0, tfLow: 0.7
 };
 
 function analyzeTF(c) {
   const atr = M.atr(c, 14);
   const ms = marketStructure(c);
+  const pa = priceAction(c, atr);
   const tr = trendEMA(c);
   const mo = momentum(c);
   const ca = candles(c);
   const zo = zones(c, atr);
   const li = liquidity(c);
   const el = elliott(c);
-  return { atr, ms, tr, mo, ca, zo, li, el, price: c[c.length - 1].c };
+  return { atr, ms, pa, tr, mo, ca, zo, li, el, price: c[c.length - 1].c };
 }
 
 function buildSignal(tfData, usdtSeries, params, book) {
   const p = Object.assign({}, DEFAULT_W, params || {});
+  // Price-action-only mode: mute the lagging/indicator & macro modules so the
+  // signal is driven purely by price action, structure, S/D, candles & liquidity.
+  if (p.paOnly) { p.trend = 0; p.momentum = 0; p.elliott = 0; p.tether = 0; p.orderbook = 0; }
   const H = analyzeTF(tfData.high);
   const Mi = analyzeTF(tfData.mid);
   const L = analyzeTF(tfData.low);
   const td = tetherDom(usdtSeries);
   const ob = orderbook(book, tfData.low[tfData.low.length - 1].c);
 
+  const paW = p.priceAction != null ? p.priceAction : 2.2;
+  const sumW = paW + p.structure + p.trend + p.momentum + p.candles + p.zones + p.liquidity + p.elliott;
+  // guard: if a (mis)configuration zeroes every module weight, fall back to a
+  // price-action-only divisor so the score never becomes NaN (div-by-zero).
+  const tfDiv = sumW > 0 ? sumW : 1;
   function tfScore(A) {
-    return (A.ms.score * p.structure + A.tr.score * p.trend + A.mo.score * p.momentum +
-      A.ca.score * p.candles + A.zo.score * p.zones + A.li.score * p.liquidity +
-      A.el.score * p.elliott) /
-      (p.structure + p.trend + p.momentum + p.candles + p.zones + p.liquidity + p.elliott);
+    return (A.pa.score * paW + A.ms.score * p.structure + A.tr.score * p.trend +
+      A.mo.score * p.momentum + A.ca.score * p.candles + A.zo.score * p.zones +
+      A.li.score * p.liquidity + A.el.score * p.elliott) / tfDiv;
   }
   const sH = tfScore(H), sM = tfScore(Mi), sL = tfScore(L);
-  const tfNet = (sH * p.tfHigh + sM * p.tfMid + sL * p.tfLow) / (p.tfHigh + p.tfMid + p.tfLow);
+  const tfWsum = (p.tfHigh + p.tfMid + p.tfLow) || 1;
+  const tfNet = (sH * p.tfHigh + sM * p.tfMid + sL * p.tfLow) / tfWsum;
   // blend tether (cross-TF) + live order book (only when available)
-  const baseW = p.structure + p.trend + p.momentum + p.candles + p.zones + p.liquidity + p.elliott;
+  const baseW = tfDiv;
   const obW = ob.available ? (p.orderbook != null ? p.orderbook : 0.8) : 0;
-  const net = (tfNet * baseW + td.score * p.tether + ob.score * obW) /
-    (baseW + p.tether + obW);
+  const blendDiv = (baseW + p.tether + obW) || 1;
+  const net = (tfNet * baseW + td.score * p.tether + ob.score * obW) / blendDiv;
 
   const price = tfData.low[tfData.low.length - 1].c;
   const atr = L.atr[L.atr.length - 1] || price * 0.02;
@@ -448,12 +601,14 @@ function buildSignal(tfData, usdtSeries, params, book) {
   const confidence = Math.min(100, Math.round(Math.abs(net) * 140));
 
   const factors = [
+    Object.assign({ tf: 'LTF' }, L.pa),
+    Object.assign({ tf: 'HTF' }, H.pa),
     Object.assign({ tf: 'HTF' }, H.ms),
+    Object.assign({ tf: 'HTF' }, H.zo),
+    Object.assign({ tf: 'LTF' }, L.ca),
+    Object.assign({ tf: 'MTF' }, Mi.li),
     Object.assign({ tf: 'HTF' }, H.tr),
     Object.assign({ tf: 'MTF' }, Mi.mo),
-    Object.assign({ tf: 'LTF' }, L.ca),
-    Object.assign({ tf: 'HTF' }, H.zo),
-    Object.assign({ tf: 'MTF' }, Mi.li),
     Object.assign({ tf: 'HTF' }, H.el),
     Object.assign({ tf: 'GLOBAL' }, td)
   ];
@@ -467,94 +622,188 @@ function buildSignal(tfData, usdtSeries, params, book) {
 }
 
 /* ============================================================
-   BACKTEST — walk forward over daily candles.
-   At each bar i (after warmup), compute signal using data up to i,
-   then simulate forward: which hits first, stop or t2 (primary target).
-   Returns trades + stats. Uses R-multiples.
+   BACKTEST — dollar-based walk-forward simulator.
+   Models: initial capital, % risk per trade (position sizing),
+   partial exits at TP1/TP2/TP3, Delta Exchange ETH-futures fees
+   (maker/taker + GST on notional), leverage cap, optional
+   move-stop-to-breakeven after TP1, and trade style (scalp/day/swing).
+   Returns trades + dollar stats + equity curve.
    ============================================================ */
+
+// Delta Exchange ETH perpetual-futures fee defaults (editable via opts).
+// Source: Delta support — futures maker 0.02%, taker 0.05%, +18% GST.
+const DELTA_FEES = { taker: 0.0005, maker: 0.0002, gst: 0.18 };
+
+// Trade-style presets (max bars held + cooldown bars between trades).
+const STYLES = {
+  scalp: { fwdMax: 14, cooldown: 1, label: 'Scalp' },
+  day:   { fwdMax: 30, cooldown: 2, label: 'Day Trade' },
+  swing: { fwdMax: 90, cooldown: 3, label: 'Swing Trade' }
+};
+
 function backtest(daily, usdtAligned, params, opts) {
   opts = opts || {};
-  const warmup = opts.warmup || 210;     // need EMA200 etc.
-  const fwdMax = opts.fwdMax || 30;      // bars to resolve a trade
-  const htf = opts.htf || 5;             // HTF resample factor
-  const mtf = opts.mtf || 2;             // MTF resample factor
-  const fee = opts.fee != null ? opts.fee : 0.0008; // round-trip approx
-  const cooldownBars = opts.cooldown || 2;
-  const trades = [];
-  let lastExitIdx = -999;
+  const warmup = opts.warmup || 210;
+  const htf = opts.htf || 5;
+  const mtf = opts.mtf || 2;
+
+  // ----- money-management config -----
+  const capital   = opts.capital   != null ? opts.capital   : 10000; // initial $
+  const riskPct   = opts.riskPct   != null ? opts.riskPct   : 1.0;    // % equity / trade
+  const maxLev     = opts.maxLeverage != null ? opts.maxLeverage : 25; // notional cap
+  const beAfterTP1 = opts.beAfterTP1 !== false;                        // default ON
+  // TP allocation (% of position closed at each target); auto-normalized.
+  let split = opts.tpSplit || [50, 30, 20];
+  const sSum = split.reduce((a, b) => a + (isFinite(b) && b > 0 ? b : 0), 0);
+  // if the split is empty/zero, default to the full position closing at TP1
+  split = sSum > 0 ? split.map(x => (isFinite(x) && x > 0 ? x : 0) / sSum) : [1, 0, 0];
+  // fees
+  const F = Object.assign({}, DELTA_FEES, opts.fees || {});
+  const feeOf = (notional, kind) => notional * (kind === 'maker' ? F.maker : F.taker) * (1 + F.gst);
+  // style
+  const style = STYLES[opts.style] || STYLES.swing;
+  const fwdMax = opts.fwdMax || style.fwdMax;
+  const cooldownBars = opts.cooldown != null ? opts.cooldown : style.cooldown;
+
   const p = Object.assign({}, DEFAULT_W, params || {});
+  const trades = [];
+  let equity = capital;
+  let lastExitIdx = -999;
 
   for (let i = warmup; i < daily.length - 1; i++) {
     if (i - lastExitIdx < cooldownBars) continue;
+    if (equity <= 0) break; // account blown
     const upto = daily.slice(0, i + 1);
-    const tfData = {
-      high: resample(upto, htf),
-      mid: resample(upto, mtf),
-      low: upto
-    };
+    const tfData = { high: resample(upto, htf), mid: resample(upto, mtf), low: upto };
     if (tfData.high.length < 60) continue;
     const us = usdtAligned ? usdtAligned.slice(0, i + 1) : null;
     let sig;
     try { sig = buildSignal(tfData, us, p); } catch (e) { continue; }
     if (sig.side === 'NEUTRAL' || !isFinite(sig.stop)) continue;
 
-    const entry = sig.entry;
-    const stop = sig.stop;
-    const tgt = sig.t2; // primary target = 2.5R default
-    const risk = Math.abs(entry - stop);
-    if (risk <= 0) continue;
+    const isLong = sig.side === 'LONG';
+    const entry = sig.entry, stop = sig.stop;
+    const tps = [sig.t1, sig.t2, sig.t3];
+    const stopDist = Math.abs(entry - stop);
+    if (stopDist <= 0) continue;
 
-    // simulate forward
-    let exit = null, exitIdx = null, result = null;
-    for (let j = i + 1; j <= Math.min(i + fwdMax, daily.length - 1); j++) {
+    // ----- position sizing from $ risk, capped by leverage -----
+    const riskDollars = equity * (riskPct / 100);
+    let qty = riskDollars / stopDist;
+    let notional = qty * entry;
+    const maxNotional = equity * maxLev;
+    if (notional > maxNotional) { qty = maxNotional / entry; notional = qty * entry; }
+    if (qty <= 0) continue;
+
+    const entryFee = feeOf(notional, 'taker'); // market entry = taker
+    let remaining = qty, curStop = stop, grossPnl = 0, exitFees = entryFee;
+    const fills = [];
+    let filled = 0; // how many TPs filled
+    let closed = false, exitIdx = null;
+
+    const end = Math.min(i + fwdMax, daily.length - 1);
+    for (let j = i + 1; j <= end && !closed; j++) {
       const bar = daily[j];
-      if (sig.side === 'LONG') {
-        if (bar.l <= stop) { exit = stop; result = 'loss'; exitIdx = j; break; }
-        if (bar.h >= tgt) { exit = tgt; result = 'win'; exitIdx = j; break; }
-      } else {
-        if (bar.h >= stop) { exit = stop; result = 'loss'; exitIdx = j; break; }
-        if (bar.l <= tgt) { exit = tgt; result = 'win'; exitIdx = j; break; }
+      // 1) stop check first (pessimistic / conservative within-bar ordering)
+      const stopHit = isLong ? bar.l <= curStop : bar.h >= curStop;
+      if (stopHit) {
+        const px = curStop;
+        const pnl = isLong ? remaining * (px - entry) : remaining * (entry - px);
+        grossPnl += pnl; exitFees += feeOf(remaining * px, 'taker');
+        fills.push({ price: px, qty: remaining, reason: curStop === entry ? 'BE-stop' : 'stop' });
+        remaining = 0; closed = true; exitIdx = j; break;
+      }
+      // 2) take-profits in order
+      while (filled < 3) {
+        const tp = tps[filled];
+        const tpHit = isLong ? bar.h >= tp : bar.l <= tp;
+        if (!tpHit) break;
+        const qtyP = (filled === 2) ? remaining : qty * split[filled]; // last TP closes remainder
+        const useQ = Math.min(qtyP, remaining);
+        filled++;
+        if (useQ > 1e-9) { // only record a real (non-zero) partial fill
+          const pnl = isLong ? useQ * (tp - entry) : useQ * (entry - tp);
+          grossPnl += pnl; exitFees += feeOf(useQ * tp, 'maker'); // TP = limit = maker
+          fills.push({ price: tp, qty: useQ, reason: 'TP' + filled });
+          remaining -= useQ;
+        }
+        if (beAfterTP1 && filled === 1) curStop = entry; // SL → breakeven after TP1
+        if (remaining <= 1e-9) { remaining = 0; closed = true; exitIdx = j; break; }
       }
     }
-    if (exit == null) { // time exit at last available
-      exitIdx = Math.min(i + fwdMax, daily.length - 1);
-      exit = daily[exitIdx].c;
-      result = (sig.side === 'LONG' ? exit > entry : exit < entry) ? 'win-t' : 'loss-t';
+    // 3) time exit for any leftover
+    if (!closed) {
+      exitIdx = end;
+      const px = daily[end].c;
+      const pnl = isLong ? remaining * (px - entry) : remaining * (entry - px);
+      grossPnl += pnl; exitFees += feeOf(remaining * px, 'taker');
+      fills.push({ price: px, qty: remaining, reason: 'time' });
+      remaining = 0;
     }
-    let R = sig.side === 'LONG' ? (exit - entry) / risk : (entry - exit) / risk;
-    R -= fee / (risk / entry); // subtract fees in R terms (approx)
+
+    const pnlAfterFees = grossPnl - exitFees;
+    equity += pnlAfterFees;
+    const netR = pnlAfterFees / riskDollars;
+
     trades.push({
-      idx: i, date: daily[i].t, side: sig.side, entry, stop, target: tgt,
-      exit, exitIdx, R, result: R > 0 ? 'WIN' : 'LOSS', conf: sig.confidence
+      idx: i, date: daily[i].t, side: sig.side, style: style.label,
+      entry, stop, t1: tps[0], t2: tps[1], t3: tps[2],
+      qty, notional, fees: exitFees, grossPnl, netPnl: pnlAfterFees, netR,
+      fills, exitIdx, holdBars: exitIdx - i, tpsFilled: filled,
+      equity, conf: sig.confidence,
+      result: pnlAfterFees > 0 ? 'WIN' : 'LOSS'
     });
     lastExitIdx = exitIdx;
   }
-  return summarize(trades);
+  return summarize(trades, capital);
 }
 
-function summarize(trades) {
+function summarize(trades, capital) {
+  capital = capital != null ? capital : 10000;
   const n = trades.length;
-  const wins = trades.filter(t => t.R > 0);
-  const losses = trades.filter(t => t.R <= 0);
-  const grossW = wins.reduce((a, t) => a + t.R, 0);
-  const grossL = Math.abs(losses.reduce((a, t) => a + t.R, 0));
-  let eq = 0, peak = 0, maxDD = 0;
-  const curve = [];
+  const wins = trades.filter(t => t.netPnl > 0);
+  const losses = trades.filter(t => t.netPnl <= 0);
+  const grossProfit = wins.reduce((a, t) => a + t.netPnl, 0);
+  const grossLoss = Math.abs(losses.reduce((a, t) => a + t.netPnl, 0));
+  const totalFees = trades.reduce((a, t) => a + t.fees, 0);
+
+  // equity curve in dollars + drawdown
+  let eq = capital, peak = capital, maxDD = 0, maxDDpct = 0, cumR = 0;
+  const curve = [{ date: trades.length ? trades[0].date - 86400 : 0, equity: capital, dd: 0, ddPct: 0, eqR: 0 }];
   trades.forEach(t => {
-    eq += t.R; peak = Math.max(peak, eq);
-    maxDD = Math.max(maxDD, peak - eq);
-    curve.push({ date: t.date, eq, dd: peak - eq });
+    eq = t.equity; cumR += t.netR;
+    peak = Math.max(peak, eq);
+    const dd = peak - eq, ddPct = peak > 0 ? dd / peak * 100 : 0;
+    maxDD = Math.max(maxDD, dd); maxDDpct = Math.max(maxDDpct, ddPct);
+    curve.push({ date: t.date, equity: eq, dd, ddPct, eqR: cumR });
   });
-  const expectancy = n ? trades.reduce((a, t) => a + t.R, 0) / n : 0;
+
+  const finalEquity = trades.length ? trades[trades.length - 1].equity : capital;
+  const netProfit = finalEquity - capital;
+  const returnPct = capital > 0 ? netProfit / capital * 100 : 0;
+  const totalR = trades.reduce((a, t) => a + t.netR, 0);
+
+  // CAGR from first→last trade timestamps
+  let cagr = 0;
+  if (trades.length >= 2) {
+    const years = (trades[trades.length - 1].date - trades[0].date) / (365.25 * 86400);
+    if (years > 0 && finalEquity > 0) cagr = (Math.pow(finalEquity / capital, 1 / years) - 1) * 100;
+  }
+
   return {
     trades, curve,
     stats: {
       n, wins: wins.length, losses: losses.length,
       winRate: n ? wins.length / n * 100 : 0,
-      profitFactor: grossL ? grossW / grossL : (grossW > 0 ? Infinity : 0),
-      totalR: eq, expectancy, maxDD,
-      avgWin: wins.length ? grossW / wins.length : 0,
-      avgLoss: losses.length ? -grossL / losses.length : 0
+      profitFactor: grossLoss ? grossProfit / grossLoss : (grossProfit > 0 ? Infinity : 0),
+      capital, finalEquity, netProfit, returnPct, cagr,
+      totalFees, totalR, expectancyR: n ? totalR / n : 0,
+      expectancyDollars: n ? netProfit / n : 0,
+      maxDD, maxDDpct,
+      avgWin: wins.length ? grossProfit / wins.length : 0,
+      avgLoss: losses.length ? -grossLoss / losses.length : 0,
+      // back-compat alias used by old objective
+      expectancy: n ? totalR / n : 0
     }
   };
 }
@@ -568,23 +817,25 @@ function calibrate(daily, usdtAligned, onProgress, opts) {
     threshold: [0.08, 0.12, 0.16, 0.20],
     slMult: [1.0, 1.5, 2.0],
     t2R: [2.0, 2.5, 3.0],
-    tether: [0.5, 1.0, 1.6]
+    tether: [0.5, 1.2],
+    priceAction: [1.6, 2.2, 3.0] // sweep the price-action emphasis itself
   };
   let best = null, tested = 0;
-  const total = grid.threshold.length * grid.slMult.length * grid.t2R.length * grid.tether.length;
+  const total = grid.threshold.length * grid.slMult.length * grid.t2R.length * grid.tether.length * grid.priceAction.length;
   const results = [];
   for (const threshold of grid.threshold)
     for (const slMult of grid.slMult)
       for (const t2R of grid.t2R)
-        for (const tether of grid.tether) {
-          const params = { threshold, slMult, t2R, t1R: Math.max(1, t2R - 1), t3R: t2R + 1.5, tether };
+        for (const tether of grid.tether)
+        for (const priceAction of grid.priceAction) {
+          const params = { threshold, slMult, t2R, t1R: Math.max(1, t2R - 1), t3R: t2R + 1.5, tether, priceAction };
           const bt = backtest(daily, usdtAligned, params, opts);
           const s = bt.stats;
-          // objective: require minimum sample, reward expectancy & PF, penalize DD
+          // objective: require minimum sample, reward $ return & PF, penalize % drawdown
           let obj = -Infinity;
           if (s.n >= 8) {
             const pf = isFinite(s.profitFactor) ? s.profitFactor : 3;
-            obj = s.expectancy * Math.sqrt(s.n) * Math.min(pf, 3) / (1 + s.maxDD * 0.15);
+            obj = (s.returnPct / 100) * Math.sqrt(s.n) * Math.min(pf, 3) / (1 + s.maxDDpct / 100 * 1.5);
           }
           results.push({ params, stats: s, obj });
           if (!best || obj > best.obj) best = { params, stats: s, obj, bt };
@@ -596,9 +847,9 @@ function calibrate(daily, usdtAligned, onProgress, opts) {
 
 /* ---------- expose ---------- */
 global.Engine = {
-  M, resample, marketStructure, trendEMA, momentum, candles, zones,
+  M, resample, marketStructure, priceAction, trendEMA, momentum, candles, zones,
   liquidity, orderbook, elliott, tetherDom, analyzeTF, buildSignal, backtest,
-  summarize, calibrate, DEFAULT_W
+  summarize, calibrate, DEFAULT_W, DELTA_FEES, STYLES
 };
 
 })(window);

@@ -7,7 +7,9 @@ const E = window.Engine;
 const $ = s => document.querySelector(s);
 const fmt = (n, d = 2) => n == null || !isFinite(n) ? '—' :
   Number(n).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
-const usd = n => '$' + fmt(n, 2);
+// place the sign before the $ so negatives read "-$1,234.50" not "$-1,234.50"
+const usd = n => (n == null || !isFinite(n)) ? '—' :
+  (n < 0 ? '-$' + fmt(-n, 2) : '$' + fmt(n, 2));
 
 let STATE = { daily: null, usdt: null, calibrated: null, lastSignal: null };
 
@@ -206,18 +208,22 @@ async function runAnalysis() {
     $('#hUsdt').textContent = ud.current != null ? ud.current.toFixed(2) + '%' : 'n/a';
 
     // Build MTF confluence per the active profile
-    const params = STATE.calibrated || {};
+    const paOnly = !!($('#paOnly') && $('#paOnly').checked);
+    const params = Object.assign({}, STATE.calibrated || {}, { paOnly });
     const tfData = {
       high: E.resample(daily, prof.htf),
       mid: E.resample(daily, prof.mtf),
       low: daily
     };
-    setStatus('Running deep multi-factor analysis…', true);
+    setStatus(paOnly ? 'Running price-action-only analysis…' : 'Running deep multi-factor analysis…', true);
     const sig = E.buildSignal(tfData, usdtAligned, params, book);
     STATE.lastSignal = sig;
+    STATE.lastDaily = daily;
 
     renderSignal(sig);
     renderFactors(sig);
+    renderPriceAction(sig);
+    drawPaChart(daily, sig);
     renderZones(sig.analysis.H.zo, sig.price);
     renderLiquidity(sig.analysis.M.li, sig.price);
     renderOrderBook(sig.analysis.ob, sig.price);
@@ -278,23 +284,194 @@ const ICONS = {
   bear: '<svg viewBox="0 0 24 24" fill="none" stroke="#ea3943" stroke-width="2"><path d="M3 7l6 6 4-4 8 8"/><path d="M17 17h4v-4"/></svg>',
   neu: '<svg viewBox="0 0 24 24" fill="none" stroke="#8a98b5" stroke-width="2"><path d="M4 12h16"/></svg>'
 };
+// module weight lookup (mirrors engine DEFAULT_W) for display
+const W_LABEL = {
+  'Price Action (PA)': 'priceAction', 'Market Structure': 'structure',
+  'Supply & Demand': 'zones', 'Candlestick Patterns': 'candles',
+  'Liquidity Heat Map': 'liquidity', 'Trend (EMA Stack)': 'trend',
+  'Momentum (RSI+MACD)': 'momentum', 'Elliott Wave (model)': 'elliott',
+  'Tether Dominance (inverse)': 'tether', 'Order-Book Liquidity': 'orderbook'
+};
 function renderFactors(s) {
+  const W = Object.assign({}, (window.Engine && window.Engine.DEFAULT_W) || {}, s.params || {});
+  const wOf = label => { const key = W_LABEL[label]; return key && W[key] != null ? W[key] : null; };
   const rows = s.factors.map(f => {
     const k = f.score > 0.1 ? 'bull' : f.score < -0.1 ? 'bear' : 'neu';
     const pill = k === 'bull' ? 'BULLISH' : k === 'bear' ? 'BEARISH' : 'NEUTRAL';
-    return `<div class="fac">
+    const w = wOf(f.label);
+    const isPA = f.label === 'Price Action (PA)';
+    const wTag = w != null ? `<span class="tag" style="background:${w>=1.5?'#1c2f1f':'#171c28'};color:${w>=1.5?'#16c784':'var(--dim)'}">w ${w}</span>` : '';
+    return `<div class="fac" style="${isPA?'background:linear-gradient(90deg,rgba(139,92,246,.10),transparent);border-radius:8px':''}">
       <div class="ic">${ICONS[k]}</div>
-      <div class="t"><b>${f.label} <span class="tag" style="background:#10182a;color:var(--dim)">${f.tf}</span></b><span>${f.detail}</span></div>
+      <div class="t"><b>${f.label} <span class="tag" style="background:#10182a;color:var(--dim)">${f.tf}</span> ${wTag}</b><span>${f.detail}</span></div>
       <div class="pill ${k}">${pill} ${f.score>0?'+':''}${f.score.toFixed(2)}</div>
     </div>`;
   }).join('');
   $('#facBody').innerHTML = rows +
-    `<div style="margin-top:14px;font-size:12px;color:var(--mut)">Weighted net of all factors across 3 timeframes = <b style="color:var(--cyn)">${s.net.toFixed(3)}</b>. Long if ≥ +${(s.params.threshold||0.12)}, Short if ≤ −${(s.params.threshold||0.12)}.</div>`;
+    `<div style="margin-top:14px;font-size:12px;color:var(--mut)">Modules ordered & weighted by price-action priority (w = weight). Weighted net across 3 timeframes = <b style="color:var(--cyn)">${s.net.toFixed(3)}</b>. Long if ≥ +${(s.params.threshold||0.12)}, Short if ≤ −${(s.params.threshold||0.12)}.</div>`;
 }
 
 /* ============================================================
    RENDER: supply/demand zones
    ============================================================ */
+function renderPriceAction(sig) {
+  const H = sig.analysis.H, L = sig.analysis.L, price = sig.price;
+  const paH = H.pa, paL = L.pa;
+  const ms = H.ms;
+  // dealing range premium/discount bar (HTF)
+  const r = paH.range || { hi: price * 1.1, lo: price * 0.9, posPct: 0.5 };
+  const pos = Math.max(0, Math.min(1, r.posPct));
+  const zoneLabel = pos < 0.4 ? 'DISCOUNT' : pos > 0.6 ? 'PREMIUM' : 'EQUILIBRIUM';
+  const zoneColor = pos < 0.4 ? 'var(--grn)' : pos > 0.6 ? 'var(--red)' : 'var(--mut)';
+
+  // unfilled FVGs (combine HTF + LTF, nearest to price)
+  const fvgs = [...(paH.fvg || []).map(f => ({ ...f, tf: 'HTF' })), ...(paL.fvg || []).map(f => ({ ...f, tf: 'LTF' }))]
+    .sort((a, b) => Math.abs((a.mid - price)) - Math.abs((b.mid - price))).slice(0, 5);
+  const fvgTags = fvgs.map(f =>
+    `<span class="tag" style="background:${f.type==='bull'?'#0d3a2c':'#3a1216'};color:${f.type==='bull'?'#16c784':'#ea3943'}">${f.tf} ${f.type==='bull'?'Bull':'Bear'} FVG ${usd(f.lo)}–${usd(f.hi)}</span>`
+  ).join(' ');
+
+  const paPill = v => {
+    const k = v > 0.1 ? 'bull' : v < -0.1 ? 'bear' : 'neu';
+    const t = k === 'bull' ? 'BULLISH' : k === 'bear' ? 'BEARISH' : 'NEUTRAL';
+    return `<span class="pill ${k}">${t} ${v>0?'+':''}${v.toFixed(2)}</span>`;
+  };
+
+  $('#paBody').innerHTML = `
+    <div class="flexrow" style="gap:14px;margin-bottom:14px">
+      <div class="cchip" style="flex:1">Market Structure (HTF) ${paPill(ms.score)}<div style="font-size:12px;color:var(--mut);margin-top:6px">${ms.detail}</div></div>
+    </div>
+    <div class="flexrow" style="gap:14px;margin-bottom:6px">
+      <div style="flex:1"><div class="muted" style="font-size:12px;margin-bottom:6px">Price Action — HTF ${paPill(paH.score)}</div><div style="font-size:12.5px">${paH.detail}</div></div>
+      <div style="flex:1"><div class="muted" style="font-size:12px;margin-bottom:6px">Price Action — LTF ${paPill(paL.score)}</div><div style="font-size:12.5px">${paL.detail}</div></div>
+    </div>
+    <h3 class="sub">Dealing Range — Premium / Discount (HTF)</h3>
+    <div style="position:relative;height:34px;border-radius:8px;overflow:hidden;background:linear-gradient(90deg,rgba(22,199,132,.25),rgba(90,98,120,.15) 50%,rgba(234,57,67,.25))">
+      <div style="position:absolute;left:50%;top:0;bottom:0;width:1px;background:#5d6b88"></div>
+      <div style="position:absolute;left:${(pos*100).toFixed(1)}%;top:0;bottom:0;width:3px;background:var(--cyn);box-shadow:0 0 8px var(--cyn)"></div>
+      <div style="position:absolute;left:6px;top:8px;font-size:11px;color:var(--grn)">DISCOUNT ${usd(r.lo)}</div>
+      <div style="position:absolute;right:6px;top:8px;font-size:11px;color:var(--red)">PREMIUM ${usd(r.hi)}</div>
+    </div>
+    <div style="margin-top:8px;font-size:12.5px">Price <b style="color:var(--cyn)">${usd(price)}</b> sits at <b style="color:${zoneColor}">${(pos*100).toFixed(0)}% (${zoneLabel})</b> of the HTF dealing range. ${zoneLabel==='DISCOUNT'?'Discount favors longs / with-trend dip buys.':zoneLabel==='PREMIUM'?'Premium favors shorts / with-trend rally sells.':'Equilibrium — wait for displacement toward a premium/discount extreme.'}</div>
+    <h3 class="sub">Unfilled Fair-Value Gaps (imbalances) near price</h3>
+    <div>${fvgTags || '<span class="muted">No unfilled FVGs near current price.</span>'}</div>
+    <div style="margin-top:12px;font-size:11.5px;color:var(--dim)">Price action is the highest-weighted layer of the engine (FVGs · liquidity sweeps · order blocks · premium/discount · rejection wicks · BOS/CHoCH). EMA/RSI/MACD only confirm.</div>`;
+}
+
+/* ============================================================
+   Price-Action MAP — own canvas candlestick chart with overlays:
+   unfilled FVGs, order blocks, swing H/L, premium/discount band,
+   and the live entry / stop / targets.
+   ============================================================ */
+function drawPaChart(daily, sig) {
+  const cv = $('#paChart'); if (!cv) return;
+  const dpr = window.devicePixelRatio || 1;
+  const W = cv.width = cv.clientWidth * dpr;
+  const H = cv.height = 360 * dpr;
+  const ctx = cv.getContext('2d');
+  ctx.clearRect(0, 0, W, H);
+  if (!daily || daily.length < 5) return;
+
+  const N = Math.min(120, daily.length);          // last N candles
+  const view = daily.slice(daily.length - N);
+  const padL = 8 * dpr, padR = 64 * dpr, padT = 14 * dpr, padB = 22 * dpr;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+
+  let lo = Math.min(...view.map(c => c.l)), hi = Math.max(...view.map(c => c.h));
+  // include levels so they're visible
+  const L = sig.analysis.L, pa = L.pa;
+  const extra = [sig.entry, sig.stop, sig.t1, sig.t2, sig.t3].filter(isFinite);
+  extra.forEach(v => { lo = Math.min(lo, v); hi = Math.max(hi, v); });
+  const pad = (hi - lo) * 0.06 || hi * 0.02; lo -= pad; hi += pad;
+  const span = (hi - lo) || 1;
+  const t0 = view[0].t, t1 = view[view.length - 1].t, tspan = (t1 - t0) || 1;
+  const x = t => padL + plotW * ((t - t0) / tspan);
+  const y = v => padT + plotH * (1 - (v - lo) / span);
+  const cw = Math.max(1.5 * dpr, plotW / N * 0.62);
+
+  // grid + right-axis price labels
+  ctx.strokeStyle = '#161e30'; ctx.fillStyle = '#5d6b88'; ctx.lineWidth = dpr;
+  ctx.font = `${10.5 * dpr}px sans-serif`; ctx.textAlign = 'left';
+  for (let g = 0; g <= 4; g++) {
+    const v = lo + span * g / 4, yy = y(v);
+    ctx.beginPath(); ctx.moveTo(padL, yy); ctx.lineTo(W - padR, yy); ctx.stroke();
+    ctx.fillText('$' + Math.round(v).toLocaleString('en-US'), W - padR + 4 * dpr, yy + 3.5 * dpr);
+  }
+
+  // premium/discount band from HTF range
+  const r = (sig.analysis.H.pa && sig.analysis.H.pa.range) || null;
+  if (r && r.hi > r.lo) {
+    const yEq = y(r.eq);
+    ctx.fillStyle = 'rgba(234,57,67,.05)'; ctx.fillRect(padL, y(r.hi), plotW, Math.max(0, yEq - y(r.hi)));
+    ctx.fillStyle = 'rgba(22,199,132,.05)'; ctx.fillRect(padL, yEq, plotW, Math.max(0, y(r.lo) - yEq));
+    ctx.strokeStyle = 'rgba(120,130,150,.4)'; ctx.setLineDash([3 * dpr, 3 * dpr]);
+    ctx.beginPath(); ctx.moveTo(padL, yEq); ctx.lineTo(W - padR, yEq); ctx.stroke(); ctx.setLineDash([]);
+  }
+
+  // collect overlays from HTF + LTF (dedupe-ish by drawing both, clipped to view)
+  const inView = t => t >= t0 - tspan * 0.02;
+  const fvgs = [...(sig.analysis.H.pa.fvg || []), ...(pa.fvg || [])].filter(f => f.t && inView(f.t));
+  const obs = [...(sig.analysis.H.pa.orderBlocks || []), ...(pa.orderBlocks || [])].filter(o => o.t && inView(o.t));
+
+  // FVG rectangles (extend to right edge — they remain relevant until filled)
+  fvgs.forEach(f => {
+    const xx = x(Math.max(f.t, t0)); const w = (W - padR) - xx;
+    const yTop = y(f.hi), hgt = Math.max(1 * dpr, y(f.lo) - y(f.hi));
+    ctx.fillStyle = f.type === 'bull' ? 'rgba(22,199,132,.13)' : 'rgba(234,57,67,.13)';
+    ctx.fillRect(xx, yTop, w, hgt);
+    ctx.strokeStyle = f.type === 'bull' ? 'rgba(22,199,132,.35)' : 'rgba(234,57,67,.35)';
+    ctx.lineWidth = dpr; ctx.strokeRect(xx, yTop, w, hgt);
+  });
+
+  // order blocks (solid edge boxes extended right)
+  obs.forEach(o => {
+    const xx = x(Math.max(o.t, t0)); const w = (W - padR) - xx;
+    const yTop = y(o.hi), hgt = Math.max(1.5 * dpr, y(o.lo) - y(o.hi));
+    ctx.fillStyle = o.type === 'bull' ? 'rgba(22,199,132,.10)' : 'rgba(234,57,67,.10)';
+    ctx.fillRect(xx, yTop, w, hgt);
+    ctx.strokeStyle = o.type === 'bull' ? '#16c784' : '#ea3943';
+    ctx.lineWidth = 1.4 * dpr; ctx.strokeRect(xx, yTop, w, hgt);
+    ctx.fillStyle = o.type === 'bull' ? '#16c784' : '#ea3943';
+    ctx.font = `${9.5 * dpr}px sans-serif`;
+    ctx.fillText(o.type === 'bull' ? 'OB+' : 'OB-', xx + 2 * dpr, yTop + 10 * dpr);
+  });
+
+  // candles
+  view.forEach(c => {
+    const cx = x(c.t), up = c.c >= c.o;
+    ctx.strokeStyle = up ? '#16c784' : '#ea3943'; ctx.fillStyle = up ? '#16c784' : '#ea3943';
+    ctx.lineWidth = dpr;
+    ctx.beginPath(); ctx.moveTo(cx, y(c.h)); ctx.lineTo(cx, y(c.l)); ctx.stroke();
+    const yO = y(c.o), yC = y(c.c);
+    ctx.fillRect(cx - cw / 2, Math.min(yO, yC), cw, Math.max(1 * dpr, Math.abs(yC - yO)));
+  });
+
+  // swing H/L markers from LTF structure
+  const sw = (L.ms && L.ms.swings) || { hi: [], lo: [] };
+  ctx.fillStyle = '#f0b90b'; ctx.font = `${9 * dpr}px sans-serif`;
+  const baseIdx = daily.length - N;
+  sw.hi.slice(-6).forEach(s => { if (s.i >= baseIdx) { const cx = x(daily[s.i].t); ctx.beginPath(); ctx.arc(cx, y(s.p) - 5 * dpr, 2.4 * dpr, 0, 7); ctx.fill(); } });
+  sw.lo.slice(-6).forEach(s => { if (s.i >= baseIdx) { const cx = x(daily[s.i].t); ctx.beginPath(); ctx.arc(cx, y(s.p) + 5 * dpr, 2.4 * dpr, 0, 7); ctx.fill(); } });
+
+  // entry / stop / targets lines
+  const line = (v, col, lab) => {
+    if (!isFinite(v)) return;
+    ctx.strokeStyle = col; ctx.lineWidth = 1.3 * dpr; ctx.setLineDash([6 * dpr, 4 * dpr]);
+    ctx.beginPath(); ctx.moveTo(padL, y(v)); ctx.lineTo(W - padR, y(v)); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = col; ctx.font = `${9.5 * dpr}px sans-serif`; ctx.textAlign = 'left';
+    ctx.fillText(lab, padL + 3 * dpr, y(v) - 3 * dpr);
+  };
+  if (sig.side !== 'NEUTRAL') {
+    line(sig.entry, '#22d3ee', 'Entry ' + usd(sig.entry));
+    line(sig.stop, '#ea3943', 'SL ' + usd(sig.stop));
+    line(sig.t1, '#16c784', 'TP1'); line(sig.t2, '#16c784', 'TP2'); line(sig.t3, '#16c784', 'TP3');
+  }
+
+  const note = $('#paChartNote'), srcEl = $('#paMapSrc');
+  if (srcEl) srcEl.textContent = `${(STATE.profile&&STATE.profile.label)||''} · last ${N} candles`;
+  if (note) note.innerHTML = `Boxes = unfilled <b style="color:#16c784">bull</b>/<b style="color:#ea3943">bear</b> FVGs & order blocks (extended right until filled). Dots = swing highs/lows. Dashed = live trade levels.${(sig.params&&sig.params.paOnly)?' <b style="color:#cbb6ff">PA-only mode active.</b>':''}`;
+}
+
 function renderZones(zo, price) {
   const all = [...zo.supply.map(z => ({ ...z })), ...zo.demand.map(z => ({ ...z }))]
     .sort((a, b) => b.hi - a.hi);
@@ -413,18 +590,38 @@ function loadTradingView(force) {
 /* ============================================================
    BACKTEST + CALIBRATE
    ============================================================ */
+// read the money-management form into a backtest opts object
+function readMM(prof) {
+  const num = (id, d) => { const v = parseFloat(($('#' + id) || {}).value); return isFinite(v) ? v : d; };
+  return {
+    htf: prof.htf, mtf: prof.mtf, warmup: prof.warmup,
+    capital: num('mmCapital', 10000),
+    riskPct: num('mmRisk', 1),
+    maxLeverage: num('mmLev', 25),
+    style: ($('#mmStyle') || {}).value || 'swing',
+    tpSplit: [num('mmTp1', 50), num('mmTp2', 30), num('mmTp3', 20)],
+    beAfterTP1: (($('#mmBe') || {}).value || 'yes') === 'yes',
+    fees: {
+      maker: num('mmMaker', 0.02) / 100,
+      taker: num('mmTaker', 0.05) / 100,
+      gst: num('mmGst', 18) / 100
+    }
+  };
+}
+
 async function runCalibration() {
   if (!STATE.daily) { setStatus('Run the analysis first to load data.', false); return; }
   const btn = $('#calibBtn');
   btn.disabled = true;
-  setStatus('Sweeping strategy parameters over 2 years of data…', true);
+  setStatus('Sweeping strategy parameters with your money-management settings…', true);
   $('#calibChips').innerHTML = '<div class="cchip">Calibrating… <b id="cprog">0%</b></div>';
   await new Promise(r => setTimeout(r, 50));
 
   // run in chunks to keep UI alive
   const daily = STATE.daily, ua = STATE.usdtAligned;
   const prof = STATE.profile || activeProfile();
-  const opts = { htf: prof.htf, mtf: prof.mtf, warmup: prof.warmup, fwdMax: prof.fwdMax };
+  const opts = readMM(prof);
+  STATE.mmOpts = opts;
   let out;
   await new Promise(resolve => {
     setTimeout(() => {
@@ -441,24 +638,30 @@ async function runCalibration() {
   renderBacktest(best.bt);
 
   // re-run live signal with calibrated params (keep live order book in the mix)
+  const paOnly = !!($('#paOnly') && $('#paOnly').checked);
   const tfData = { high: E.resample(daily, prof.htf), mid: E.resample(daily, prof.mtf), low: daily };
-  const sig = E.buildSignal(tfData, ua, STATE.calibrated, STATE.book);
+  const sig = E.buildSignal(tfData, ua, Object.assign({}, STATE.calibrated, { paOnly }), STATE.book);
   STATE.lastSignal = sig;
-  renderSignal(sig); renderFactors(sig); renderOrderBook(sig.analysis.ob, sig.price);
+  renderSignal(sig); renderFactors(sig); renderPriceAction(sig); drawPaChart(daily, sig); renderOrderBook(sig.analysis.ob, sig.price);
 
-  setStatus(`Calibration complete · best of ${out.results.length} parameter sets applied to the live signal above.`, false);
+  const bs = best.bt.stats;
+  setStatus(`Calibration complete · best of ${out.results.length} sets · ${usd(bs.capital)} → ${usd(bs.finalEquity)} (${bs.returnPct>=0?'+':''}${bs.returnPct.toFixed(1)}%, ${bs.n} trades, ${bs.winRate.toFixed(0)}% win, $${bs.totalFees.toFixed(0)} fees). Applied to the live signal above.`, false);
   btn.disabled = false;
 }
 
 function renderCalib(best) {
-  const p = best.params, s = best.stats;
+  const p = best.params, o = STATE.mmOpts || {};
   const objTxt = isFinite(best.obj) ? best.obj.toFixed(3) : 'n/a (too few trades)';
+  const styleLabel = ({ scalp: 'Scalp', day: 'Day Trade', swing: 'Swing' })[o.style] || o.style || 'Swing';
   $('#calibChips').innerHTML = `
+    <div class="cchip">Style <b>${styleLabel}</b></div>
+    <div class="cchip">Capital <b>${usd(o.capital||10000)}</b></div>
+    <div class="cchip">Risk/trade <b>${(o.riskPct!=null?o.riskPct:1)}%</b></div>
     <div class="cchip">Signal threshold <b>±${p.threshold}</b></div>
     <div class="cchip">Stop (ATR×) <b>${p.slMult}</b></div>
     <div class="cchip">Primary target <b>${p.t2R}R</b></div>
     <div class="cchip">Tether weight <b>${p.tether}</b></div>
-    <div class="cchip">Objective score <b>${objTxt}</b></div>`;
+    <div class="cchip">Objective <b>${objTxt}</b></div>`;
 }
 
 function renderBacktest(bt) {
@@ -466,14 +669,18 @@ function renderBacktest(bt) {
   const s = bt.stats;
   const k = (lab, val, cls, sub) => `<div class="kpi"><div class="k">${lab}</div><div class="v ${cls||''}">${val}</div>${sub?`<div class="sub" style="font-size:11px;color:var(--mut)">${sub}</div>`:''}</div>`;
   $('#kpis').innerHTML =
-    k('Trades', s.n) +
-    k('Win Rate', s.winRate.toFixed(1) + '%', s.winRate >= 50 ? 'pos' : 'neg', `${s.wins}W / ${s.losses}L`) +
+    k('Initial Capital', usd(s.capital)) +
+    k('Final Equity', usd(s.finalEquity), s.finalEquity >= s.capital ? 'pos' : 'neg') +
+    k('Net Profit', (s.netProfit >= 0 ? '+' : '') + usd(s.netProfit), s.netProfit >= 0 ? 'pos' : 'neg', (s.returnPct>=0?'+':'') + s.returnPct.toFixed(1) + '%') +
+    k('CAGR', (s.cagr >= 0 ? '+' : '') + s.cagr.toFixed(1) + '%', s.cagr >= 0 ? 'pos' : 'neg', 'annualized') +
+    k('Trades', s.n, '', `${s.wins}W / ${s.losses}L`) +
+    k('Win Rate', s.winRate.toFixed(1) + '%', s.winRate >= 50 ? 'pos' : 'neg') +
     k('Profit Factor', isFinite(s.profitFactor) ? s.profitFactor.toFixed(2) : '∞', s.profitFactor >= 1 ? 'pos' : 'neg') +
-    k('Total Return', (s.totalR >= 0 ? '+' : '') + s.totalR.toFixed(1) + 'R', s.totalR >= 0 ? 'pos' : 'neg', '1R risk/trade') +
-    k('Expectancy', (s.expectancy >= 0 ? '+' : '') + s.expectancy.toFixed(3) + 'R', s.expectancy >= 0 ? 'pos' : 'neg', 'per trade') +
-    k('Max Drawdown', '-' + s.maxDD.toFixed(1) + 'R', 'neg') +
-    k('Avg Win', '+' + s.avgWin.toFixed(2) + 'R', 'pos') +
-    k('Avg Loss', s.avgLoss.toFixed(2) + 'R', 'neg');
+    k('Max Drawdown', '-' + s.maxDDpct.toFixed(1) + '%', 'neg', '-' + usd(s.maxDD)) +
+    k('Total Fees Paid', usd(s.totalFees), 'neg', 'Delta futures + GST') +
+    k('Avg Win', '+' + usd(s.avgWin), 'pos') +
+    k('Avg Loss', usd(s.avgLoss), 'neg') +
+    k('Expectancy', (s.expectancyDollars >= 0 ? '+' : '') + usd(s.expectancyDollars), s.expectancyDollars >= 0 ? 'pos' : 'neg', 'per trade · ' + (s.expectancyR>=0?'+':'') + s.expectancyR.toFixed(2) + 'R');
   STATE.lastCurve = bt.curve;
   drawEquity(bt.curve);
   drawTrades(bt.trades);
@@ -483,54 +690,65 @@ function drawEquity(curve) {
   const cv = $('#equity'), ctx = cv.getContext('2d');
   const W = cv.width = cv.clientWidth * devicePixelRatio;
   const H = cv.height = 240 * devicePixelRatio;
-  ctx.scale(1, 1);
   ctx.clearRect(0, 0, W, H);
   if (!curve.length) return;
-  const pad = 36 * devicePixelRatio;
-  const eqs = curve.map(c => c.eq);
-  const min = Math.min(0, ...eqs), max = Math.max(0, ...eqs);
+  const eqs = curve.map(c => c.equity);
+  let min = Math.min(...eqs), max = Math.max(...eqs);
+  const padBand = (max - min) * 0.08 || max * 0.05 || 1;
+  min -= padBand; max += padBand;
   const span = (max - min) || 1;
+  const pad = 56 * devicePixelRatio;
   const x = i => pad + (W - pad * 1.2) * (i / (curve.length - 1 || 1));
-  const y = v => H - pad - (H - pad * 1.6) * ((v - min) / span);
-  // grid
+  const y = v => H - pad * 0.7 - (H - pad * 1.4) * ((v - min) / span);
+  // grid + $ labels
   ctx.strokeStyle = '#1a2336'; ctx.lineWidth = devicePixelRatio;
   ctx.fillStyle = '#5d6b88'; ctx.font = `${11*devicePixelRatio}px sans-serif`;
   for (let g = 0; g <= 4; g++) {
     const v = min + span * g / 4, yy = y(v);
     ctx.beginPath(); ctx.moveTo(pad, yy); ctx.lineTo(W - pad * 0.2, yy); ctx.stroke();
-    ctx.fillText(v.toFixed(1) + 'R', 2 * devicePixelRatio, yy + 4 * devicePixelRatio);
+    ctx.fillText('$' + Math.round(v).toLocaleString('en-US'), 2 * devicePixelRatio, yy + 4 * devicePixelRatio);
   }
-  // zero line
-  ctx.strokeStyle = '#39414f'; ctx.lineWidth = devicePixelRatio;
-  ctx.beginPath(); ctx.moveTo(pad, y(0)); ctx.lineTo(W - pad * 0.2, y(0)); ctx.stroke();
-  // drawdown fill
+  // starting-capital reference line
+  const cap = (STATE.mmOpts && STATE.mmOpts.capital) || curve[0].equity;
+  if (cap >= min && cap <= max) {
+    ctx.strokeStyle = '#39414f'; ctx.setLineDash([4 * devicePixelRatio, 4 * devicePixelRatio]);
+    ctx.beginPath(); ctx.moveTo(pad, y(cap)); ctx.lineTo(W - pad * 0.2, y(cap)); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  // equity area + line
   ctx.beginPath();
-  curve.forEach((c, i) => { const xx = x(i), yy = y(c.eq - c.dd); i ? ctx.lineTo(xx, yy) : ctx.moveTo(xx, yy); });
-  for (let i = curve.length - 1; i >= 0; i--) ctx.lineTo(x(i), y(curve[i].eq));
-  ctx.fillStyle = 'rgba(234,57,67,.12)'; ctx.fill();
-  // equity line
-  ctx.beginPath();
-  curve.forEach((c, i) => { const xx = x(i), yy = y(c.eq); i ? ctx.lineTo(xx, yy) : ctx.moveTo(xx, yy); });
+  curve.forEach((c, i) => { const xx = x(i), yy = y(c.equity); i ? ctx.lineTo(xx, yy) : ctx.moveTo(xx, yy); });
   ctx.strokeStyle = '#16c784'; ctx.lineWidth = 2.2 * devicePixelRatio; ctx.stroke();
-  // fill under equity
-  ctx.lineTo(x(curve.length - 1), y(0)); ctx.lineTo(x(0), y(0)); ctx.closePath();
+  ctx.lineTo(x(curve.length - 1), y(min)); ctx.lineTo(x(0), y(min)); ctx.closePath();
   ctx.fillStyle = 'rgba(22,199,132,.10)'; ctx.fill();
+  // drawdown band (peak-to-equity) in red
+  let peak = curve[0].equity;
+  ctx.beginPath();
+  curve.forEach((c, i) => { peak = Math.max(peak, c.equity); const xx = x(i), yy = y(peak); i ? ctx.lineTo(xx, yy) : ctx.moveTo(xx, yy); });
+  for (let i = curve.length - 1; i >= 0; i--) ctx.lineTo(x(i), y(curve[i].equity));
+  ctx.closePath(); ctx.fillStyle = 'rgba(234,57,67,.10)'; ctx.fill();
 }
 
 function drawTrades(trades) {
   const tb = $('#tradeTbl tbody');
   const rows = trades.slice(-40).reverse().map((t, i) => {
-    const wcls = t.R > 0 ? 'tw' : 'tl';
+    const wcls = t.netPnl > 0 ? 'tw' : 'tl';
+    const reasons = (t.fills || []).map(f => f.reason).join(', ');
     return `<tr>
       <td>${trades.length - i}</td>
       <td>${new Date(t.date * 1000).toLocaleDateString()}</td>
       <td style="color:${t.side==='LONG'?'var(--grn)':'var(--red)'}">${t.side}</td>
-      <td>${usd(t.entry)}</td><td>${usd(t.stop)}</td><td>${usd(t.target)}</td><td>${usd(t.exit)}</td>
-      <td class="${wcls}">${t.R>=0?'+':''}${t.R.toFixed(2)}R</td>
-      <td class="${wcls}">${t.R>0?'WIN':'LOSS'}</td>
+      <td>${t.style||''}</td>
+      <td>${usd(t.entry)}</td>
+      <td>${fmt(t.qty,3)}</td>
+      <td>${t.tpsFilled}/3</td>
+      <td style="font-size:11px">${reasons}</td>
+      <td class="tl">${usd(t.fees)}</td>
+      <td class="${wcls}">${t.netPnl>=0?'+':''}${usd(t.netPnl)}</td>
+      <td>${usd(t.equity)}</td>
     </tr>`;
   }).join('');
-  tb.innerHTML = rows || '<tr><td colspan="9" class="muted">No trades generated with these parameters.</td></tr>';
+  tb.innerHTML = rows || '<tr><td colspan="11" class="muted">No trades generated with these parameters.</td></tr>';
 }
 
 /* ---------- events ---------- */
@@ -548,12 +766,19 @@ $('#profile').addEventListener('change', () => {
   loadTradingView();
   if (STATE.daily) runAnalysis();
 });
+$('#paOnly').addEventListener('change', () => {
+  // toggling price-action-only re-runs the analysis (uses cached data, no refetch needed)
+  if (STATE.daily) runAnalysis();
+});
 
-// redraw equity curve on resize (canvas is sized from clientWidth)
+// redraw canvases on resize (sized from clientWidth)
 let _rsz;
 window.addEventListener('resize', () => {
   clearTimeout(_rsz);
-  _rsz = setTimeout(() => { if (STATE.lastCurve) drawEquity(STATE.lastCurve); }, 200);
+  _rsz = setTimeout(() => {
+    if (STATE.lastCurve) drawEquity(STATE.lastCurve);
+    if (STATE.lastDaily && STATE.lastSignal) drawPaChart(STATE.lastDaily, STATE.lastSignal);
+  }, 200);
 });
 
 // try TV early so the widget shows even before run
